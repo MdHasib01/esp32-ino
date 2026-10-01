@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <WiFiUdp.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 
 using namespace websockets;
 
@@ -114,7 +115,7 @@ FfLn
 // this board has no mains-sensing circuit, so the backend infers a power
 // cut purely from heartbeat silence lasting that long.
 const unsigned long HEARTBEAT_INTERVAL_MS = 3000;
-const unsigned long RECONNECT_INTERVAL_MS = 5000;
+const unsigned long RECONNECT_INTERVAL_MS = 2000;
 
 // Fixed self-restart so a long-running board doesn't freeze. Not
 // configurable from the dashboard — the firmware always enforces it.
@@ -136,6 +137,7 @@ WebsocketsClient client;
 WiFiUDP udp;
 
 bool authenticated = false;
+bool firstConnectSinceBoot = true;
 unsigned long lastHeartbeat = 0;
 unsigned long lastReconnectAttempt = 0;
 
@@ -176,10 +178,31 @@ void parseMac(const char* macStr, byte* out) {
 // BACKEND PROTOCOL
 // ==========================
 
+// Why the board last booted — lets the server tell a real power cut
+// (power_on/brownout) apart from the scheduled restart (software).
+const char* resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power_on";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SW:       return "software";
+    case ESP_RST_PANIC:    return "panic";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_EXT:      return "external";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    default:               return "unknown";
+  }
+}
+
 void sendAuth() {
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<256> doc;
   doc["type"] = "auth";
   doc["apiKey"] = apiKey;
+  doc["resetReason"] = resetReasonName();
+  doc["firstSinceBoot"] = firstConnectSinceBoot;
+  doc["bootMs"] = millis();
+  doc["rssi"] = WiFi.RSSI();
   String json;
   serializeJson(doc, json);
   client.send(json);
@@ -216,8 +239,12 @@ void handleMessage(WebsocketsMessage message) {
 
   if (strcmp(type, "auth_ok") == 0) {
     authenticated = true;
+    firstConnectSinceBoot = false;
+    // The server counts the auth itself as a heartbeat, so just start the
+    // interval from here. (Sending one now as well made two heartbeats arrive
+    // back to back, which crashed the old backend.)
+    lastHeartbeat = millis();
     Serial.println("Authenticated with backend");
-    sendHeartbeat();
     return;
   }
 
@@ -325,12 +352,15 @@ void setup() {
 
   Serial.print("WiFi connected, IP: ");
   Serial.println(WiFi.localIP());
+  // Modem power-save delays every packet by up to a beacon interval.
+  WiFi.setSleep(false);
 
   udp.begin(9);
   restartTimerStart = millis();
   startWatchdog();
   client.onMessage(handleMessage);
   connectServer();
+  lastReconnectAttempt = millis();
 }
 
 void loop() {
